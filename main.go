@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"strings"
 
 	"golang.org/x/net/html"
@@ -103,6 +104,38 @@ func fetchFileInfo(client *http.Client, token, year, week string) (string, strin
 	return extractFileInfo(resp.Body)
 }
 
+func downloadPDF(client *http.Client, fileName, batchID string) error {
+	downloadURL := fmt.Sprintf(
+		"https://msi.admiralty.co.uk/NoticesToMariners/DownloadFile?fileName=%s&batchId=%s&mimeType=application%%2Fpdf&frequency=Weekly",
+		url.QueryEscape(fileName),
+		url.QueryEscape(batchID),
+	)
+
+	resp, err := client.Get(downloadURL)
+	if err != nil {
+		return fmt.Errorf("download request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	file, err := os.Create(fileName)
+	if err != nil {
+		return fmt.Errorf("create file: %w", err)
+	}
+	defer file.Close()
+
+	written, err := io.Copy(file, resp.Body)
+	if err != nil {
+		return fmt.Errorf("write file: %w", err)
+	}
+
+	fmt.Printf("Saved %s (%.1f KB)\n", fileName, float64(written)/1024)
+	return nil
+}
+
 func main() {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -128,4 +161,12 @@ func main() {
 	}
 	fmt.Println("fileName:", fileName)
 	fmt.Println("batchId: ", batchID)
+
+	if _, err := os.Stat(fileName); os.IsNotExist(err) {
+		if err := downloadPDF(client, fileName, batchID); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		fmt.Println("PDF already exists, skipping download")
+	}
 }
