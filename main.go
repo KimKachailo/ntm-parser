@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,12 @@ import (
 )
 
 const baseURL = "https://msi.admiralty.co.uk/NoticesToMariners/Weekly"
+
+type noticeQuery struct {
+	year   string
+	week   string
+	number string
+}
 
 func extractCSRFToken(body io.Reader) (string, error) {
 	doc, err := html.Parse(body)
@@ -236,6 +243,14 @@ func extractNotice(pdfPath, noticeNumber string) (string, error) {
 }
 
 func main() {
+	queries := []noticeQuery{
+		{"2026", "20", "2269(P)/26"},
+		{"2026", "20", "2242(P)/26"},
+		{"2026", "20", "2295(P)/26"},
+		{"2026", "17", "1848(T)/26"},
+		{"2026", "17", "1124(T)/26"},
+	}
+
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		log.Fatal(err)
@@ -252,27 +267,54 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("CSRF token:", token)
 
-	fileName, batchID, err := fetchFileInfo(client, token, "2026", "20")
+	outFile, err := os.Create("notices.csv")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("fileName:", fileName)
-	fmt.Println("batchId: ", batchID)
+	defer outFile.Close()
 
-	if _, err := os.Stat(fileName); os.IsNotExist(err) {
-		if err := downloadPDF(client, fileName, batchID); err != nil {
-			log.Fatal(err)
+	writer := csv.NewWriter(outFile)
+	defer writer.Flush()
+
+	writer.Write([]string{"Notice", "Week", "Year", "Text"})
+
+	pdfCache := make(map[string]string)
+
+	for _, q := range queries {
+		fmt.Printf("Processing %s (week %s/%s)...\n", q.number, q.week, q.year)
+
+		cacheKey := q.year + "-" + q.week
+
+		pdfName, ok := pdfCache[cacheKey]
+		if !ok {
+			fileName, batchID, err := fetchFileInfo(client, token, q.year, q.week)
+			if err != nil {
+				log.Printf("ERROR fetchFileInfo %s: %v", q.number, err)
+				continue
+			}
+
+			if _, err := os.Stat(fileName); os.IsNotExist(err) {
+				if err := downloadPDF(client, fileName, batchID); err != nil {
+					log.Printf("ERROR downloadPDF %s: %v", q.number, err)
+					continue
+				}
+			}
+
+			pdfCache[cacheKey] = fileName
+			pdfName = fileName
 		}
-	} else {
-		fmt.Println("PDF already exists, skipping download")
+
+		text, err := extractNotice(pdfName, q.number)
+		if err != nil {
+			log.Printf("ERROR extractNotice %s: %v", q.number, err)
+			writer.Write([]string{q.number, q.week, q.year, "NOT FOUND"})
+			continue
+		}
+
+		writer.Write([]string{q.number, q.week, q.year, text})
+		fmt.Printf("OK: %s\n", q.number)
 	}
 
-	notice, err := extractNotice(fileName, "2269(P)/26")
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("\n--- Notice ---")
-	fmt.Println(notice)
+	fmt.Println("Done. Results saved to notices.csv")
 }
