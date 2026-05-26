@@ -8,6 +8,8 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/exec"
+	"regexp"
 	"strings"
 
 	"golang.org/x/net/html"
@@ -136,6 +138,103 @@ func downloadPDF(client *http.Client, fileName, batchID string) error {
 	return nil
 }
 
+func extractBlock(text, marker string, isContinued bool) (string, error) {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+
+	startLine := -1
+	noticeRe := regexp.MustCompile(`^\d{4}(?:\([TP]\))?/\d{2,4}`)
+
+	for i, line := range lines {
+		if !strings.Contains(line, marker) {
+			continue
+		}
+		if strings.Contains(line, "....") {
+			continue
+		}
+		if isContinued {
+			startLine = i
+			break
+		}
+		after := strings.TrimLeft(strings.TrimPrefix(line, marker), " \t")
+		if len(after) > 0 && after[0] >= 'A' && after[0] <= 'Z' {
+			startLine = i
+			break
+		}
+	}
+
+	if startLine == -1 {
+		return "", fmt.Errorf("block %q not found", marker)
+	}
+
+	var blockLines []string
+	emptyCount := 0
+
+	for i := startLine; i < len(lines); i++ {
+		line := lines[i]
+
+		if strings.TrimSpace(line) == "" {
+			emptyCount++
+			blockLines = append(blockLines, line)
+			continue
+		}
+
+		if emptyCount >= 2 && noticeRe.MatchString(line) {
+			for len(blockLines) > 0 && strings.TrimSpace(blockLines[len(blockLines)-1]) == "" {
+				blockLines = blockLines[:len(blockLines)-1]
+			}
+			break
+		}
+
+		emptyCount = 0
+		blockLines = append(blockLines, line)
+	}
+
+	result := strings.TrimSpace(strings.Join(blockLines, "\n"))
+
+	if idx := regexp.MustCompile(`(?m)^\s*Wk\d+/\d+`).FindStringIndex(result); idx != nil {
+		result = strings.TrimSpace(result[:idx[0]])
+	}
+	if idx := regexp.MustCompile(`(?m)^\s*\d+\.\d+\s*$`).FindStringIndex(result); idx != nil {
+		result = strings.TrimSpace(result[:idx[0]])
+	}
+
+	return result, nil
+}
+
+func extractNotice(pdfPath, noticeNumber string) (string, error) {
+	cmd := exec.Command("pdftotext", "-layout", pdfPath, "-")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("pdftotext: %w", err)
+	}
+	text := string(output)
+
+	block, err := extractBlock(text, noticeNumber, false)
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	contMarker := ""
+	for _, line := range lines {
+		if strings.Contains(line, noticeNumber) && strings.Contains(line, "(continued)") {
+			contMarker = strings.TrimSpace(line)
+			break
+		}
+	}
+
+	if contMarker != "" {
+		if cont, err := extractBlock(text, contMarker, true); err == nil {
+			contLines := strings.SplitN(cont, "\n", 2)
+			if len(contLines) == 2 {
+				block = block + "\n" + strings.TrimSpace(contLines[1])
+			}
+		}
+	}
+
+	return block, nil
+}
+
 func main() {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -169,4 +268,11 @@ func main() {
 	} else {
 		fmt.Println("PDF already exists, skipping download")
 	}
+
+	notice, err := extractNotice(fileName, "2269(P)/26")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("\n--- Notice ---")
+	fmt.Println(notice)
 }
