@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/html"
@@ -24,6 +25,24 @@ type noticeResult struct {
 	week   string
 	year   string
 	text   string
+}
+
+type pdfCache struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
+
+func (c *pdfCache) get(key string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.data[key]
+	return v, ok
+}
+
+func (c *pdfCache) set(key string, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.data[key] = data
 }
 
 func extractCSRFToken(body io.Reader) (string, error) {
@@ -115,7 +134,7 @@ func fetchFileInfo(client *http.Client, token, year, week string) (string, strin
 	return extractFileInfo(resp.Body)
 }
 
-func downloadPDF(client *http.Client, fileName, batchID string) error {
+func downloadPDFToMemory(client *http.Client, fileName, batchID string) ([]byte, error) {
 	downloadURL := fmt.Sprintf(
 		"https://msi.admiralty.co.uk/NoticesToMariners/DownloadFile?fileName=%s&batchId=%s&mimeType=application%%2Fpdf&frequency=Weekly",
 		url.QueryEscape(fileName),
@@ -124,27 +143,15 @@ func downloadPDF(client *http.Client, fileName, batchID string) error {
 
 	resp, err := client.Get(downloadURL)
 	if err != nil {
-		return fmt.Errorf("download request: %w", err)
+		return nil, fmt.Errorf("download request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status: %s", resp.Status)
+		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
-	file, err := os.Create(fileName)
-	if err != nil {
-		return fmt.Errorf("create file: %w", err)
-	}
-	defer file.Close()
-
-	written, err := io.Copy(file, resp.Body)
-	if err != nil {
-		return fmt.Errorf("write file: %w", err)
-	}
-
-	fmt.Printf("Saved %s (%.1f KB)\n", fileName, float64(written)/1024)
-	return nil
+	return io.ReadAll(resp.Body)
 }
 
 func extractBlock(text, marker string, isContinued bool) (string, error) {
@@ -210,8 +217,17 @@ func extractBlock(text, marker string, isContinued bool) (string, error) {
 	return result, nil
 }
 
-func extractNotice(pdfPath, noticeNumber string) (string, error) {
-	cmd := exec.Command("pdftotext", "-layout", pdfPath, "-")
+func extractNoticeFromBytes(data []byte, noticeNumber string) (string, error) {
+	tmp, err := os.CreateTemp("", "ntm-*.pdf")
+	if err != nil {
+		return "", fmt.Errorf("create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	tmp.Write(data)
+	tmp.Close()
+	defer os.Remove(tmpName)
+
+	cmd := exec.Command("pdftotext", "-layout", tmpName, "-")
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("pdftotext: %w", err)
@@ -265,7 +281,28 @@ func startWeek() int {
 	return 52
 }
 
-func findNotice(client *http.Client, token string, number string, pdfCache map[string]string) noticeResult {
+func getPDFData(client *http.Client, token, year, week string, cache *pdfCache) ([]byte, error) {
+	cacheKey := year + "-" + week
+
+	if data, ok := cache.get(cacheKey); ok {
+		return data, nil
+	}
+
+	fileName, batchID, err := fetchFileInfo(client, token, year, week)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := downloadPDFToMemory(client, fileName, batchID)
+	if err != nil {
+		return nil, err
+	}
+
+	cache.set(cacheKey, data)
+	return data, nil
+}
+
+func findNotice(client *http.Client, token, number string, cache *pdfCache) noticeResult {
 	year, err := yearFromNotice(number)
 	if err != nil {
 		return noticeResult{number, "", "", "NOT FOUND"}
@@ -273,28 +310,19 @@ func findNotice(client *http.Client, token string, number string, pdfCache map[s
 
 	for week := startWeek(); week >= 1; week-- {
 		weekStr := fmt.Sprintf("%d", week)
-		cacheKey := year + "-" + weekStr
 
-		pdfName, ok := pdfCache[cacheKey]
-		if !ok {
-			fileName, batchID, err := fetchFileInfo(client, token, year, weekStr)
-			if err != nil {
-				continue
-			}
-			if _, err := os.Stat(fileName); os.IsNotExist(err) {
-				if err := downloadPDF(client, fileName, batchID); err != nil {
-					continue
-				}
-			}
-			pdfCache[cacheKey] = fileName
-			pdfName = fileName
+		data, err := getPDFData(client, token, year, weekStr, cache)
+		if err != nil {
+			continue
 		}
 
-		text, err := extractNotice(pdfName, number)
-		if err == nil {
-			fmt.Printf("  Found %s in week %s\n", number, weekStr)
-			return noticeResult{number, weekStr, year, text}
+		text, err := extractNoticeFromBytes(data, number)
+		if err != nil {
+			continue
 		}
+
+		fmt.Printf("  Found %s in week %s\n", number, weekStr)
+		return noticeResult{number, weekStr, year, text}
 	}
 
 	return noticeResult{number, "", year, "NOT FOUND"}
@@ -324,6 +352,22 @@ func main() {
 		log.Fatal(err)
 	}
 
+	cache := &pdfCache{data: make(map[string][]byte)}
+
+	results := make([]noticeResult, len(notices))
+	var wg sync.WaitGroup
+
+	for i, number := range notices {
+		wg.Add(1)
+		go func(i int, number string) {
+			defer wg.Done()
+			fmt.Printf("Searching %s...\n", number)
+			results[i] = findNotice(client, token, number, cache)
+		}(i, number)
+	}
+
+	wg.Wait()
+
 	outFile, err := os.Create("notices.csv")
 	if err != nil {
 		log.Fatal(err)
@@ -334,12 +378,8 @@ func main() {
 	defer writer.Flush()
 	writer.Write([]string{"Notice", "Week", "Year", "Text"})
 
-	pdfCache := make(map[string]string)
-
-	for _, number := range notices {
-		fmt.Printf("Searching %s...\n", number)
-		result := findNotice(client, token, number, pdfCache)
-		writer.Write([]string{result.number, result.week, result.year, result.text})
+	for _, r := range results {
+		writer.Write([]string{r.number, r.week, r.year, r.text})
 	}
 
 	fmt.Println("Done. Results saved to notices.csv")
