@@ -12,16 +12,18 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"golang.org/x/net/html"
 )
 
 const baseURL = "https://msi.admiralty.co.uk/NoticesToMariners/Weekly"
 
-type noticeQuery struct {
-	year   string
-	week   string
+type noticeResult struct {
 	number string
+	week   string
+	year   string
+	text   string
 }
 
 func extractCSRFToken(body io.Reader) (string, error) {
@@ -242,14 +244,68 @@ func extractNotice(pdfPath, noticeNumber string) (string, error) {
 	return block, nil
 }
 
-func main() {
-	queries := []noticeQuery{
-		{"2026", "20", "2269(P)/26"},
-		{"2026", "20", "2242(P)/26"},
-		{"2026", "20", "2295(P)/26"},
-		{"2026", "17", "1848(T)/26"},
-		{"2026", "17", "1124(T)/26"},
+func yearFromNotice(number string) (string, error) {
+	re := regexp.MustCompile(`/(\d{2,4})$`)
+	m := re.FindStringSubmatch(number)
+	if m == nil {
+		return "", fmt.Errorf("cannot extract year from %q", number)
 	}
+	y := m[1]
+	if len(y) == 2 {
+		y = "20" + y
+	}
+	return y, nil
+}
+
+func startWeek() int {
+	_, week := time.Now().ISOWeek()
+	if week < 52 {
+		return week + 1
+	}
+	return 52
+}
+
+func findNotice(client *http.Client, token string, number string, pdfCache map[string]string) noticeResult {
+	year, err := yearFromNotice(number)
+	if err != nil {
+		return noticeResult{number, "", "", "NOT FOUND"}
+	}
+
+	for week := startWeek(); week >= 1; week-- {
+		weekStr := fmt.Sprintf("%d", week)
+		cacheKey := year + "-" + weekStr
+
+		pdfName, ok := pdfCache[cacheKey]
+		if !ok {
+			fileName, batchID, err := fetchFileInfo(client, token, year, weekStr)
+			if err != nil {
+				continue
+			}
+			if _, err := os.Stat(fileName); os.IsNotExist(err) {
+				if err := downloadPDF(client, fileName, batchID); err != nil {
+					continue
+				}
+			}
+			pdfCache[cacheKey] = fileName
+			pdfName = fileName
+		}
+
+		text, err := extractNotice(pdfName, number)
+		if err == nil {
+			fmt.Printf("  Found %s in week %s\n", number, weekStr)
+			return noticeResult{number, weekStr, year, text}
+		}
+	}
+
+	return noticeResult{number, "", year, "NOT FOUND"}
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: ntm-parser \"2269(P)/26\" \"1848(T)/26\" ...")
+		os.Exit(1)
+	}
+	notices := os.Args[1:]
 
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -276,44 +332,14 @@ func main() {
 
 	writer := csv.NewWriter(outFile)
 	defer writer.Flush()
-
 	writer.Write([]string{"Notice", "Week", "Year", "Text"})
 
 	pdfCache := make(map[string]string)
 
-	for _, q := range queries {
-		fmt.Printf("Processing %s (week %s/%s)...\n", q.number, q.week, q.year)
-
-		cacheKey := q.year + "-" + q.week
-
-		pdfName, ok := pdfCache[cacheKey]
-		if !ok {
-			fileName, batchID, err := fetchFileInfo(client, token, q.year, q.week)
-			if err != nil {
-				log.Printf("ERROR fetchFileInfo %s: %v", q.number, err)
-				continue
-			}
-
-			if _, err := os.Stat(fileName); os.IsNotExist(err) {
-				if err := downloadPDF(client, fileName, batchID); err != nil {
-					log.Printf("ERROR downloadPDF %s: %v", q.number, err)
-					continue
-				}
-			}
-
-			pdfCache[cacheKey] = fileName
-			pdfName = fileName
-		}
-
-		text, err := extractNotice(pdfName, q.number)
-		if err != nil {
-			log.Printf("ERROR extractNotice %s: %v", q.number, err)
-			writer.Write([]string{q.number, q.week, q.year, "NOT FOUND"})
-			continue
-		}
-
-		writer.Write([]string{q.number, q.week, q.year, text})
-		fmt.Printf("OK: %s\n", q.number)
+	for _, number := range notices {
+		fmt.Printf("Searching %s...\n", number)
+		result := findNotice(client, token, number, pdfCache)
+		writer.Write([]string{result.number, result.week, result.year, result.text})
 	}
 
 	fmt.Println("Done. Results saved to notices.csv")
