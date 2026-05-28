@@ -190,7 +190,7 @@ func extractBlock(text, marker string, isContinued bool) (string, error) {
 			continue
 		}
 
-		if emptyCount >= 2 && noticeRe.MatchString(line) {
+		if emptyCount >= 1 && noticeRe.MatchString(line) {
 			for len(blockLines) > 0 && strings.TrimSpace(blockLines[len(blockLines)-1]) == "" {
 				blockLines = blockLines[:len(blockLines)-1]
 			}
@@ -242,10 +242,18 @@ func extractNoticeFromBytes(data []byte, noticeNumber string) (string, error) {
 
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	contMarker := ""
-	for _, line := range lines {
-		if strings.Contains(line, noticeNumber) && strings.Contains(line, "(continued)") {
-			contMarker = strings.TrimSpace(line)
-			break
+	for i, line := range lines {
+		if strings.Contains(line, noticeNumber) {
+			// проверяем саму строку
+			if strings.Contains(line, "(continued)") {
+				contMarker = strings.TrimSpace(line)
+				break
+			}
+			// проверяем следующую строку
+			if i+1 < len(lines) && strings.Contains(lines[i+1], "(continued)") {
+				contMarker = strings.TrimSpace(line)
+				break
+			}
 		}
 	}
 
