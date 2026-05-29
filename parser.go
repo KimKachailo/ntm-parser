@@ -244,12 +244,10 @@ func extractNoticeFromBytes(data []byte, noticeNumber string) (string, error) {
 	contMarker := ""
 	for i, line := range lines {
 		if strings.Contains(line, noticeNumber) {
-			// проверяем саму строку
 			if strings.Contains(line, "(continued)") {
 				contMarker = strings.TrimSpace(line)
 				break
 			}
-			// проверяем следующую строку
 			if i+1 < len(lines) && strings.Contains(lines[i+1], "(continued)") {
 				contMarker = strings.TrimSpace(line)
 				break
@@ -265,6 +263,15 @@ func extractNoticeFromBytes(data []byte, noticeNumber string) (string, error) {
 			}
 		}
 	}
+
+	cleanedLines := strings.Split(block, "\n")
+	var filtered []string
+	for _, l := range cleanedLines {
+		if !strings.EqualFold(strings.TrimSpace(l), "(continued)") {
+			filtered = append(filtered, l)
+		}
+	}
+	block = strings.Join(filtered, "\n")
 
 	return block, nil
 }

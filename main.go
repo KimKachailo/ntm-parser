@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -86,10 +87,50 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		}
 	}
 
-	reply := tgbotapi.NewMessage(msg.Chat.ID, sb.String())
-	if _, err := bot.Send(reply); err != nil {
-		log.Printf("send error: %v", err)
+	sendLongMessage(bot, msg.Chat.ID, sb.String())
+
+	for _, r := range results {
+		log.Printf("=== %s ===\n%s\n", r.number, r.text)
 	}
+
+	filePath, err := saveResultsToDocx(results)
+	if err != nil {
+		log.Printf("docx error: %v", err)
+	} else {
+		doc := tgbotapi.NewDocument(msg.Chat.ID, tgbotapi.FilePath(filePath))
+		doc.Caption = "NtM notices — " + time.Now().Format("02 January 2006")
+		bot.Send(doc)
+		os.Remove(filePath)
+	}
+}
+
+func sendLongMessage(bot *tgbotapi.BotAPI, chatID int64, text string) {
+	const maxLen = 4096
+	parts := splitMessage(text, maxLen)
+	for _, part := range parts {
+		bot.Send(tgbotapi.NewMessage(chatID, part))
+	}
+}
+
+func splitMessage(text string, maxLen int) []string {
+	if len(text) <= maxLen {
+		return []string{text}
+	}
+	var parts []string
+	for len(text) > maxLen {
+		cut := strings.LastIndex(text[:maxLen], "\n---\n")
+		if cut == -1 {
+			cut = maxLen
+		} else {
+			cut += len("\n---\n")
+		}
+		parts = append(parts, strings.TrimSpace(text[:cut]))
+		text = strings.TrimSpace(text[cut:])
+	}
+	if text != "" {
+		parts = append(parts, text)
+	}
+	return parts
 }
 
 func main() {
