@@ -1,159 +1,206 @@
 package main
 
 import (
+	"bufio"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
-
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"unicode"
 )
 
-const baseURL = "https://msi.admiralty.co.uk/NoticesToMariners/Weekly"
+const (
+	baseURL               = "https://msi.admiralty.co.uk/NoticesToMariners/Weekly"
+	httpTimeout           = 45 * time.Second
+	maxConcurrentSearches = 4
+)
 
-func initClient() (*http.Client, string, error) {
+func initClient(ctx context.Context) (*http.Client, string, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("create cookie jar: %w", err)
 	}
-	client := &http.Client{Jar: jar}
 
-	resp, err := client.Get(baseURL)
+	client := &http.Client{
+		Jar:     jar,
+		Timeout: httpTimeout,
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("create base-page request: %w", err)
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("get base page: %w", err)
 	}
 	defer resp.Body.Close()
 
-	token, err := extractCSRFToken(resp.Body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, "", fmt.Errorf("get base page: unexpected HTTP status %s", resp.Status)
+	}
+
+	body, err := readLimited(resp.Body, maxHTMLSize, "base page")
 	if err != nil {
-		return nil, "", fmt.Errorf("csrf: %w", err)
+		return nil, "", err
+	}
+	token, err := extractCSRFToken(strings.NewReader(string(body)))
+	if err != nil {
+		return nil, "", fmt.Errorf("extract CSRF token: %w", err)
 	}
 
 	return client, token, nil
 }
 
-func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	raw := strings.FieldsFunc(msg.Text, func(r rune) bool {
-		return r == '\n' || r == ' ' || r == ','
-	})
+type searchJob struct {
+	index  int
+	number string
+}
 
-	var notices []string
-	for _, s := range raw {
-		s = strings.TrimSpace(s)
-		if s != "" {
-			notices = append(notices, s)
-		}
-	}
+func searchNotices(ctx context.Context, client *http.Client, token string, numbers []string) []noticeResult {
+	results := make([]noticeResult, len(numbers))
+	cache := newPDFCache()
+	jobs := make(chan searchJob)
 
-	if len(notices) == 0 {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "Send notice numbers, one per line:\n2269(P)/26\n1848(T)/26")
-		bot.Send(reply)
-		return
-	}
-
-	bot.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Searching %d notice(s)...", len(notices))))
-
-	client, csrfToken, err := initClient()
-	if err != nil {
-		bot.Send(tgbotapi.NewMessage(msg.Chat.ID, "Connection error, please try again later"))
-		log.Printf("initClient: %v", err)
-		return
-	}
-
-	cache := &pdfCache{data: make(map[string][]byte)}
-	results := make([]noticeResult, len(notices))
+	workerCount := min(maxConcurrentSearches, len(numbers))
 	var wg sync.WaitGroup
-
-	for i, number := range notices {
-		wg.Add(1)
-		go func(i int, number string) {
+	wg.Add(workerCount)
+	for range workerCount {
+		go func() {
 			defer wg.Done()
-			results[i] = findNotice(client, csrfToken, number, cache)
-		}(i, number)
+			for job := range jobs {
+				if err := ctx.Err(); err != nil {
+					results[job.index] = noticeResult{number: job.number, err: err}
+					continue
+				}
+				results[job.index] = findNotice(ctx, client, token, job.number, cache, time.Now())
+			}
+		}()
 	}
 
+	for i, number := range numbers {
+		jobs <- searchJob{index: i, number: number}
+	}
+	close(jobs)
 	wg.Wait()
 
-	var sb strings.Builder
-	for _, r := range results {
-		if r.text == "NOT FOUND" {
-			sb.WriteString(fmt.Sprintf("❌ %s — not found\n\n", r.number))
-		} else {
-			sb.WriteString(fmt.Sprintf("✅ %s (week %s/%s)\n\n%s\n\n---\n\n", r.number, r.week, r.year, r.text))
+	return results
+}
+
+func runCLI(ctx context.Context, numbers []string) error {
+	if len(numbers) == 0 {
+		return errors.New("no notice numbers provided")
+	}
+
+	normalized := make([]string, len(numbers))
+	for i, number := range numbers {
+		n, err := normalizeNoticeNumber(number)
+		if err != nil {
+			return err
 		}
+		normalized[i] = n
 	}
 
-	sendLongMessage(bot, msg.Chat.ID, sb.String())
-
-	for _, r := range results {
-		log.Printf("=== %s ===\n%s\n", r.number, r.text)
+	client, token, err := initClient(ctx)
+	if err != nil {
+		return fmt.Errorf("connection error: %w", err)
 	}
 
+	results := searchNotices(ctx, client, token, normalized)
 	filePath, err := saveResultsToDocx(results)
 	if err != nil {
-		log.Printf("docx error: %v", err)
-	} else {
-		doc := tgbotapi.NewDocument(msg.Chat.ID, tgbotapi.FilePath(filePath))
-		doc.Caption = "NtM notices — " + time.Now().Format("02 January 2006")
-		bot.Send(doc)
-		os.Remove(filePath)
+		return fmt.Errorf("save DOCX: %w", err)
 	}
-}
+	fmt.Println("Saved:", filePath)
 
-func sendLongMessage(bot *tgbotapi.BotAPI, chatID int64, text string) {
-	const maxLen = 4096
-	parts := splitMessage(text, maxLen)
-	for _, part := range parts {
-		bot.Send(tgbotapi.NewMessage(chatID, part))
-	}
-}
-
-func splitMessage(text string, maxLen int) []string {
-	if len(text) <= maxLen {
-		return []string{text}
-	}
-	var parts []string
-	for len(text) > maxLen {
-		cut := strings.LastIndex(text[:maxLen], "\n---\n")
-		if cut == -1 {
-			cut = maxLen
-		} else {
-			cut += len("\n---\n")
+	failed := 0
+	for _, result := range results {
+		if result.err != nil && !errors.Is(result.err, errNoticeNotFound) {
+			failed++
+			fmt.Fprintf(os.Stderr, "%s: %v\n", result.number, result.err)
 		}
-		parts = append(parts, strings.TrimSpace(text[:cut]))
-		text = strings.TrimSpace(text[cut:])
 	}
-	if text != "" {
-		parts = append(parts, text)
+	if failed > 0 {
+		return fmt.Errorf("%d notice search(es) failed; partial results were saved", failed)
 	}
-	return parts
+
+	return nil
+}
+
+func splitNoticeArguments(args []string) []string {
+	raw := strings.Join(args, " ")
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || unicode.IsSpace(r)
+	})
+
+	numbers := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			numbers = append(numbers, part)
+		}
+	}
+	return numbers
+}
+
+func readNoticeNumbers(r io.Reader, w io.Writer) ([]string, error) {
+	fmt.Fprintln(w, "NtM Parser")
+	fmt.Fprintln(w, "Enter notice numbers (one per line, empty line to search):")
+
+	var numbers []string
+	scanner := bufio.NewScanner(r)
+	for {
+		fmt.Fprint(w, "> ")
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return nil, fmt.Errorf("read input: %w", err)
+			}
+			break
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			break
+		}
+		numbers = append(numbers, line)
+	}
+
+	return numbers, nil
+}
+
+func run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) error {
+	var numbers []string
+	if len(args) > 0 {
+		numbers = splitNoticeArguments(args)
+	} else {
+		var err error
+		numbers, err = readNoticeNumbers(stdin, stdout)
+		if err != nil {
+			return err
+		}
+	}
+	if len(numbers) == 0 {
+		return errors.New("no notice numbers provided")
+	}
+
+	return runCLI(ctx, numbers)
 }
 
 func main() {
-	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if botToken == "" {
-		log.Fatal("TELEGRAM_BOT_TOKEN not set")
-	}
+	log.SetFlags(0)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	bot, err := tgbotapi.NewBotAPI(botToken)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Printf("Bot started: @%s", bot.Self.UserName)
-
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
-
-	for update := range updates {
-		if update.Message == nil {
-			continue
-		}
-		go handleMessage(bot, update.Message)
+	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout); err != nil {
+		log.Printf("Error: %v", err)
+		os.Exit(1)
 	}
 }

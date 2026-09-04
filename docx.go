@@ -1,15 +1,35 @@
-// docx.go
 package main
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 )
 
+type docxPart struct {
+	name    string
+	content string
+}
+
+func validXMLRune(r rune) bool {
+	return r == '\t' || r == '\n' || r == '\r' ||
+		(r >= 0x20 && r <= 0xD7FF) ||
+		(r >= 0xE000 && r <= 0xFFFD) ||
+		(r >= 0x10000 && r <= 0x10FFFF)
+}
+
 func xmlEscape(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if validXMLRune(r) {
+			return r
+		}
+		return -1
+	}, s)
 	s = strings.ReplaceAll(s, "&", "&amp;")
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
@@ -17,7 +37,7 @@ func xmlEscape(s string) string {
 	return s
 }
 
-func rPr(sz int, bold bool) string {
+func rPr(size int, bold bool) string {
 	boldTag := ""
 	if bold {
 		boldTag = `<w:b/>`
@@ -25,26 +45,37 @@ func rPr(sz int, bold bool) string {
 	return fmt.Sprintf(
 		`<w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Times New Roman"/>%s`+
 			`<w:sz w:val="%d"/><w:szCs w:val="%d"/></w:rPr>`,
-		boldTag, sz*2, sz*2,
+		boldTag, size*2, size*2,
 	)
 }
 
 func pPr(indentTwips int) string {
-	indStr := ""
+	indent := ""
 	if indentTwips > 0 {
-		indStr = fmt.Sprintf(`<w:ind w:left="%d"/>`, indentTwips)
+		indent = fmt.Sprintf(`<w:ind w:left="%d"/>`, indentTwips)
 	}
-	return fmt.Sprintf(`<w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/>%s</w:pPr>`, indStr)
+	return fmt.Sprintf(
+		`<w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/>%s</w:pPr>`,
+		indent,
+	)
 }
 
-func boldPara(text string, sz int) string {
-	return fmt.Sprintf(`<w:p>%s<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>`,
-		pPr(0), rPr(sz, true), xmlEscape(text))
+func boldPara(text string, size int) string {
+	return fmt.Sprintf(
+		`<w:p>%s<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>`,
+		pPr(0),
+		rPr(size, true),
+		xmlEscape(text),
+	)
 }
 
-func normalPara(text string, sz int, indentTwips int) string {
-	return fmt.Sprintf(`<w:p>%s<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>`,
-		pPr(indentTwips), rPr(sz, false), xmlEscape(text))
+func normalPara(text string, size, indentTwips int) string {
+	return fmt.Sprintf(
+		`<w:p>%s<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>`,
+		pPr(indentTwips),
+		rPr(size, false),
+		xmlEscape(text),
+	)
 }
 
 func emptyPara() string {
@@ -53,82 +84,100 @@ func emptyPara() string {
 
 func isChartsLine(s string) bool {
 	lower := strings.ToLower(s)
-	return strings.Contains(lower, "chart affected") || strings.Contains(lower, "charts affected")
+	return strings.Contains(lower, "chart affected") ||
+		strings.Contains(lower, "charts affected")
 }
 
-func buildNoticeXML(results []noticeResult) string {
-	var sb strings.Builder
+func isNumberedItem(s string) bool {
+	index := 0
+	for index < len(s) && unicode.IsDigit(rune(s[index])) {
+		index++
+	}
+	return index > 0 && index < len(s) && s[index] == '.'
+}
 
-	sb.WriteString(boldPara("NtM T&P Notices — "+time.Now().Format("02 January 2006"), 12))
-	sb.WriteString(emptyPara())
+func resultHeading(result noticeResult, firstLine string) string {
+	if result.week == "" || result.year == "" {
+		return firstLine
+	}
+	return fmt.Sprintf("%s  [week %s/%s]", firstLine, result.week, result.year)
+}
 
-	for _, r := range results {
-		if r.text == "NOT FOUND" {
-			sb.WriteString(boldPara("❌ "+r.number+" — NOT FOUND", 11))
-			sb.WriteString(emptyPara())
+func buildNoticeXMLAt(results []noticeResult, now time.Time) string {
+	var builder strings.Builder
+	builder.WriteString(boldPara("NtM T&P Notices — "+now.Format("02 January 2006"), 12))
+	builder.WriteString(emptyPara())
+
+	for _, result := range results {
+		switch {
+		case errors.Is(result.err, errNoticeNotFound):
+			builder.WriteString(boldPara("❌ "+result.number+" — NOT FOUND", 11))
+			builder.WriteString(emptyPara())
+			continue
+		case result.err != nil:
+			builder.WriteString(boldPara("⚠ "+result.number+" — ERROR", 11))
+			builder.WriteString(normalPara(result.err.Error(), 10, 0))
+			builder.WriteString(emptyPara())
 			continue
 		}
 
-		lines := strings.Split(strings.ReplaceAll(r.text, "\r\n", "\n"), "\n")
-
-		for i, line := range lines {
+		lines := strings.Split(strings.ReplaceAll(result.text, "\r\n", "\n"), "\n")
+		wroteHeading := false
+		for _, line := range lines {
 			trimmed := strings.TrimSpace(line)
-
 			if trimmed == "" {
 				continue
 			}
 
-			if trimmed == "" {
+			if !wroteHeading {
+				builder.WriteString(boldPara(resultHeading(result, trimmed), 11))
+				builder.WriteString(emptyPara())
+				wroteHeading = true
 				continue
 			}
-
-			if i == 0 {
-				sb.WriteString(boldPara(trimmed, 11))
-				sb.WriteString(emptyPara())
-				continue
-			}
-
 			if isChartsLine(trimmed) {
-				sb.WriteString(emptyPara())
-				sb.WriteString(boldPara(trimmed, 10))
+				builder.WriteString(emptyPara())
+				builder.WriteString(boldPara(trimmed, 10))
 				continue
 			}
 
 			leadingSpaces := len(line) - len(strings.TrimLeft(line, " \t"))
 			indent := 0
-			if leadingSpaces >= 8 {
+			switch {
+			case leadingSpaces >= 8:
 				indent = 720
-			} else if leadingSpaces >= 3 {
+			case leadingSpaces >= 3:
 				indent = 360
 			}
 
-			isNumberedItem := len(trimmed) > 2 && trimmed[0] >= '1' && trimmed[0] <= '9' && trimmed[1] == '.'
-			if isNumberedItem {
-				sb.WriteString(emptyPara())
+			if isNumberedItem(trimmed) {
+				builder.WriteString(emptyPara())
 			}
-
-			sb.WriteString(normalPara(trimmed, 10, indent))
-
+			builder.WriteString(normalPara(trimmed, 10, indent))
 			if strings.HasSuffix(trimmed, ":") {
-				sb.WriteString(emptyPara())
+				builder.WriteString(emptyPara())
 			}
 		}
 
-		sb.WriteString(emptyPara())
-		sb.WriteString(`<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="4" w:space="1" w:color="AAAAAA"/></w:pBdr>` +
-			`<w:spacing w:after="0"/></w:pPr></w:p>`)
-		sb.WriteString(emptyPara())
+		builder.WriteString(emptyPara())
+		builder.WriteString(
+			`<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="4" w:space="1" w:color="AAAAAA"/></w:pBdr>` +
+				`<w:spacing w:after="0"/></w:pPr></w:p>`,
+		)
+		builder.WriteString(emptyPara())
 	}
 
-	return sb.String()
+	return builder.String()
 }
 
-func saveResultsToDocx(results []noticeResult) (string, error) {
-	bodyXML := buildNoticeXML(results)
+func buildNoticeXML(results []noticeResult) string {
+	return buildNoticeXMLAt(results, time.Now())
+}
 
+func documentParts(results []noticeResult, now time.Time) []docxPart {
+	bodyXML := buildNoticeXMLAt(results, now)
 	documentXML := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:body>` + bodyXML + `
 <w:sectPr>
   <w:pgSz w:w="11906" w:h="16838"/>
@@ -136,42 +185,80 @@ func saveResultsToDocx(results []noticeResult) (string, error) {
 </w:sectPr>
 </w:body></w:document>`
 
-	files := map[string]string{
-		"[Content_Types].xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+	return []docxPart{
+		{
+			name: "[Content_Types].xml",
+			content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
 </Types>`,
-		"_rels/.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+		},
+		{
+			name: "_rels/.rels",
+			content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>`,
-		"word/document.xml": documentXML,
-		"word/_rels/document.xml.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-</Relationships>`,
+		},
+		{name: "word/document.xml", content: documentXML},
 	}
+}
 
-	filename := "ntm_notices_" + time.Now().Format("20060102_1504") + ".docx"
-	f, err := os.Create(filename)
-	if err != nil {
-		return "", err
+func writeDocx(file *os.File, parts []docxPart) (err error) {
+	writer := zip.NewWriter(file)
+	defer func() {
+		if closeErr := writer.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("close DOCX archive: %w", closeErr)
+		}
+		if syncErr := file.Sync(); err == nil && syncErr != nil {
+			err = fmt.Errorf("sync DOCX file: %w", syncErr)
+		}
+		if closeErr := file.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("close DOCX file: %w", closeErr)
+		}
+	}()
+
+	for _, part := range parts {
+		partWriter, createErr := writer.Create(part.name)
+		if createErr != nil {
+			return fmt.Errorf("create DOCX part %s: %w", part.name, createErr)
+		}
+		if _, writeErr := partWriter.Write([]byte(part.content)); writeErr != nil {
+			return fmt.Errorf("write DOCX part %s: %w", part.name, writeErr)
+		}
 	}
-	defer f.Close()
+	return nil
+}
 
-	zw := zip.NewWriter(f)
-	defer zw.Close()
+func saveResultsToDocxInDir(results []noticeResult, directory string, now time.Time) (string, error) {
+	baseName := "ntm_notices_" + now.Format("20060102_150405")
+	parts := documentParts(results, now)
 
-	for name, content := range files {
-		w, err := zw.Create(name)
+	for suffix := 0; suffix < 1000; suffix++ {
+		name := baseName + ".docx"
+		if suffix > 0 {
+			name = fmt.Sprintf("%s_%d.docx", baseName, suffix)
+		}
+		path := filepath.Join(directory, name)
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
 		if err != nil {
+			return "", fmt.Errorf("create DOCX %s: %w", path, err)
+		}
+		if err := writeDocx(file, parts); err != nil {
+			_ = os.Remove(path)
 			return "", err
 		}
-		if _, err := w.Write([]byte(content)); err != nil {
-			return "", err
-		}
+		return path, nil
 	}
 
-	return filename, nil
+	return "", fmt.Errorf("cannot allocate a unique DOCX filename in %s", directory)
+}
+
+func saveResultsToDocx(results []noticeResult) (string, error) {
+	return saveResultsToDocxInDir(results, ".", time.Now())
 }

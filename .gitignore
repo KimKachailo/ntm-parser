@@ -1,2 +1,6 @@
 *.pdf
 notices.csv
+*.docx
+*.exe
+*.test
+coverage.out
